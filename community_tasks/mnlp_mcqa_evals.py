@@ -15,9 +15,9 @@ def mmlu_harness(line, task_name: str = None):
         task_name=task_name,
         query=prompt,
         # For single token continuation
-        # choices = [" A", " B", " C", " D"]
+        choices = [" A", " B", " C", " D"],
         # For multi-token continuation
-        choices = [f" {key}. {choice}" for key, choice in zip(LETTER_INDICES, line["choices"])],
+        # choices = [f" {key}. {choice}" for key, choice in zip(LETTER_INDICES, line["choices"])],
         gold_index=gold_idx,
         instruction=f"The following are multiple choice questions (with answers) about {topic.replace('_', ' ')}.\n\n",
     )
@@ -27,14 +27,14 @@ task = LightevalTaskConfig(
     prompt_function=mmlu_harness,
     suite=["community"],
     hf_subset="",
-    hf_repo="zechen-nlp/MNLP_STEM_mcqa_demo",  # Change the repo name to the evaluation dataset that you compiled
+    hf_repo="zechen-nlp/MNLP_STEM_mcqa_evals",  # Change the repo name to the evaluation dataset that you compiled
     hf_avail_splits=["test"],
     evaluation_splits=["test"],
     metric=[Metrics.loglikelihood_acc, Metrics.loglikelihood_acc_norm_nospace],
     generation_size=-1,
     stop_sequence=None,
     trust_dataset=True,
-    limited_num_samples=10,  # Set to 0 to use all samples, specify a number to limit the number of samples for debugging purposes
+    limited_num_samples=0,  # Set to 0 to use all samples, specify a number to limit the number of samples for debugging purposes
 )
 
 # STORE YOUR EVALS

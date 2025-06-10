@@ -78,6 +78,8 @@ if is_nanotron_available():
 
 
 import logging
+import torch
+import time
 
 
 logger = logging.getLogger(__name__)
@@ -216,7 +218,7 @@ class Pipeline:
         logger.info("--- LOADING MODEL ---")
         if model_config is not None:
             if self.parallel_context:
-                return NanotronLightevalModel(
+                loaded_model = NanotronLightevalModel(
                     checkpoint_path=os.path.dirname(self.pipeline_parameters.nanotron_checkpoint_path)
                     if self.pipeline_parameters.nanotron_checkpoint_path
                     else "",
@@ -227,16 +229,24 @@ class Pipeline:
                     env_config=self.pipeline_parameters.env_config,
                 )
             else:
-                return load_model(config=model_config, env_config=self.pipeline_parameters.env_config)
-        if isinstance(model, TransformersModel):
-            return model
+                loaded_model = load_model(config=model_config, env_config=self.pipeline_parameters.env_config)
+        elif isinstance(model, TransformersModel):
+            loaded_model = model
         else:
-            return TransformersModel.from_model(
+            loaded_model = TransformersModel.from_model(
                 model=model,
                 use_chat_template=self.pipeline_parameters.use_chat_template,
                 env_config=self.pipeline_parameters.env_config,
                 accelerator=self.accelerator,
             )
+
+        if torch.cuda.is_available():
+            mem_allocated = torch.cuda.memory_allocated() / (1024**3)
+            mem_reserved = torch.cuda.memory_reserved() / (1024**3)
+            logger.info(f"VRAM allocated: {mem_allocated:.2f} GB")
+            logger.info(f"VRAM reserved: {mem_reserved:.2f} GB")
+    
+        return loaded_model
 
     def _init_tasks_and_requests(self, tasks: str):
         with local_ranks_zero_first() if self.launcher_type == ParallelismManager.NANOTRON else nullcontext():
@@ -310,6 +320,10 @@ class Pipeline:
             config=self.model_config,
         )
 
+        torch.cuda.synchronize()  # Ensure no pending CUDA ops
+        torch.cuda.reset_peak_memory_stats()
+        eval_start_time = time.time()
+
         if self.pipeline_parameters.load_responses_from_details_date_id:
             try:
                 sample_id_to_responses = self._load_responses_from_details()
@@ -332,11 +346,45 @@ class Pipeline:
                 sample_id_to_responses = self._run_model()
 
         self._compute_metrics(sample_id_to_responses)
+        
+        torch.cuda.synchronize()  # Wait for GPU to finish processing
+        eval_end_time = time.time()
+        self.eval_duration = eval_end_time - eval_start_time
+        logger.info(f"[Main Process] Evaluation time (excluding model loading): {self.eval_duration:.2f} seconds")
+
+        # Aggregate peak VRAM across processes
+        if torch.cuda.is_available():
+            if self.accelerator:
+                peak_tensor = torch.tensor([self.peak_vram_gb], device="cuda")
+                all_peaks = self.accelerator.gather(peak_tensor)
+                if self.accelerator.is_main_process:
+                    avg_peak = all_peaks.mean().item()
+                    self.average_peak_vram = avg_peak
+                    logger.info(f"[Main Process] Average Peak VRAM: {avg_peak:.2f} GB")
+            else:
+                self.average_peak_vram = self.peak_vram_gb
+                logger.info(f"Average Peak VRAM (single process): {self.average_peak_vram:.2f} GB")
 
         if self.is_main_process():
             self.evaluation_tracker.general_config_logger.log_end_time()
             self.evaluation_tracker.metrics_logger.aggregate(task_dict=self.task_dict, bootstrap_iters=1000)
             self.evaluation_tracker.details_logger.aggregate()
+
+            # === Compute Score = acc / average_peak_vram ===
+            final_dict = self.evaluation_tracker.generate_final_dict()
+            results = final_dict.get("results", {})
+            acc = results["all"].get("acc", None)
+
+            if acc is not None and hasattr(self, "average_peak_vram") and self.average_peak_vram > 0:
+                self.evaluation_score = acc / self.average_peak_vram
+                logger.info(f"Score = acc / avg VRAM = {acc:.4f} / {self.average_peak_vram:.4f} = {self.evaluation_score:.4f}")
+            else:
+                self.evaluation_score = None
+                logger.warning("Cannot compute score: acc not found or VRAM is invalid.")
+                
+            self.evaluation_tracker.average_peak_vram = self.average_peak_vram
+            self.evaluation_tracker.evaluation_score = self.evaluation_score
+            self.evaluation_tracker.evaluation_duration = self.eval_duration
 
             for weights in ["delta", "adapter"]:
                 try:
@@ -578,6 +626,12 @@ class Pipeline:
 
         # Cleaning up the model before running metrics
         self.model.cleanup()
+
+        # Record peak VRAM (in GB)
+        if torch.cuda.is_available():
+            peak_mem = torch.cuda.max_memory_allocated() / (1024 ** 3)
+            self.peak_vram_gb = peak_mem
+            logger.info(f"Peak VRAM allocated on this process: {peak_mem:.2f} GB")
 
         return sample_id_to_responses
 

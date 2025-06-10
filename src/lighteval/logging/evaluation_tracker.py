@@ -193,6 +193,10 @@ class EvaluationTracker:
             "summary_tasks": self.details_logger.compiled_details,
             "summary_general": asdict(self.details_logger.compiled_details_over_all_tasks),
         }
+        
+        results_dict["config_general"]["average_peak_vram"] = getattr(self, "average_peak_vram", None)
+        results_dict["config_general"]["evaluation_score"] = getattr(self, "evaluation_score", None)
+        results_dict["config_general"]["evaluation_duration"] = getattr(self, "evaluation_duration", None)
 
         # Create the details datasets for later upload
         details_datasets: dict[str, Dataset] = {}
